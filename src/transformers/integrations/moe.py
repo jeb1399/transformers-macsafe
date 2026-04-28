@@ -398,12 +398,19 @@ def grouped_mm_experts_forward(
     sample_weights_g = sample_weights[perm]
     selected_hidden_states_g = hidden_states[token_idx[perm]]
 
-    # Compute offsets for grouped_mm
-    # using histc instead of bincount to avoid cuda graph issues
-    # With deterministic algorithms, CPU only supports float input, CUDA only supports int input.
-    histc_input = expert_ids_g.float() if device.type == "cpu" else expert_ids_g.int()
-    tokens_per_expert = torch.histc(histc_input, bins=self.num_experts, min=0, max=self.num_experts - 1)
-    offsets = torch.cumsum(tokens_per_expert, dim=0, dtype=torch.int32)
+    # Compute offsets for grouped_mm routing
+    # Uses scatter_add-based counting for deterministic cross-device behavior
+    # Now supports MPS not just CUDA or CPU.
+    tokens_per_expert = torch.zeros(
+        self.num_experts,
+        device=expert_ids_g.device,
+        dtype=torch.int64
+    ).scatter_add_(
+        0,
+        expert_ids_g.view(-1).to(torch.int64),
+        torch.ones_like(expert_ids_g.view(-1), dtype=torch.int64)
+    )
+    offsets = torch.cumsum(tokens_per_expert, dim=0).to(torch.int32).contiguous()
 
     # Select expert weights and biases
     # NOTE: We keep all experts here and rely on offsets to target the active ones.
